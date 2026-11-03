@@ -1,0 +1,31 @@
+import { registry } from "@/capabilities/registry";
+import { setChaosMode } from "@/enterprise/simulator";
+import { loanServicing } from "@/workflows/loan-servicing";
+import { cardServicing } from "@/workflows/card-servicing";
+
+await setChaosMode("no_faults");
+const ctx = (customerId: string, workflowId = "loan-servicing") => ({ customerId, sessionId: "s1", workflowId, channel: "text" as const, turnId: "t1" });
+const all = [...loanServicing.tools, ...cardServicing.tools];
+const run = async (cid: string, name: string, args: object = {}) => {
+  const r = await registry.execute(name, args, ctx(cid), all);
+  console.log(`\n### ${cid} ${name} ${JSON.stringify(args)} ok=${r.ok} ${r.latencyMs}ms spans=${r.spans.map((s) => s.system + (s.cached ? "(c)" : "")).join(",")}`);
+  console.log(JSON.stringify(r.result, null, 1).slice(0, 1800));
+  return r;
+};
+await run("CUST-1001", "explain_emi_change");
+await run("CUST-1001", "simulate_prepayment", { amount: 50000 });
+await run("CUST-1001", "check_foreclosure");
+await run("CUST-1002", "get_payment_history", { months: 6, onlyFailed: true });
+await run("CUST-1002", "simulate_prepayment", { amount: 50000 });
+await run("CUST-1002", "check_foreclosure");
+await run("CUST-1003", "check_foreclosure");
+await run("CUST-1001", "get_loan_details", { loanId: "LN-PL-17733" });
+const a = await run("CUST-1002", "raise_payment_dispute", { paymentId: "PMT-17733-19A", reason: "bank error" });
+const id = (a.result as { actionId: string }).actionId;
+await run("CUST-1002", "confirm_action", { actionId: id });
+const c2 = { ...ctx("CUST-1002"), turnId: "t2" };
+const conf = await registry.confirmAction(id, c2, "assistant");
+console.log("confirm next turn", conf.ok, JSON.stringify(conf.result));
+console.log("again", JSON.stringify((await registry.confirmAction(id, c2, "assistant")).result));
+await run("CUST-1002", "get_card_transactions", { days: 7 });
+console.log("\nCONTEXT", JSON.stringify((await loanServicing.loadContext(ctx("CUST-1001"))).snapshot).slice(0, 1500));
