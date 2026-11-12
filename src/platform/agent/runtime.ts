@@ -16,6 +16,16 @@ import { today } from "@/lib/dates";
  */
 
 const MAX_STEPS = 6;
+/** A model that hasn't produced its first chunk by now is treated as stalled and failed over. */
+const FIRST_CHUNK_TIMEOUT_MS = Number(process.env.LLM_FIRST_CHUNK_TIMEOUT_MS) || 9_000;
+/** Stop trying further models once the turn has used this much time (function limit is 60 s). */
+const TURN_BUDGET_MS = 45_000;
+
+class LlmStallError extends Error {
+  constructor(model: string) {
+    super(`${model} produced no output within ${FIRST_CHUNK_TIMEOUT_MS} ms`);
+  }
+}
 
 export function findCitations(text: string): string[] {
   return [...new Set(text.match(/POL-[A-Z]+-\d+/g) ?? [])];
@@ -73,26 +83,57 @@ export async function runTextTurn(opts: {
     let lastError: unknown;
     for (;;) {
       const candidate = availableModels(model).find((m) => !tried.has(m));
-      if (!candidate) throw lastError;
+      if (!candidate || (lastError && performance.now() - t0 > TURN_BUDGET_MS)) throw lastError ?? new Error("No model available");
       tried.add(candidate);
+      if (candidate !== model && steps > 1) detachSignatures(contents);
+      // Per-attempt abort: fires on client disconnect OR when the model stalls before its first chunk.
+      const attempt = new AbortController();
+      const abortSignal = signal ? AbortSignal.any([signal, attempt.signal]) : attempt.signal;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const stall = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          attempt.abort();
+          reject(new LlmStallError(candidate));
+        }, FIRST_CHUNK_TIMEOUT_MS);
+      });
       try {
-        const stream = await gemini().models.generateContentStream({
-          model: candidate,
-          contents,
-          config: {
-            systemInstruction,
-            tools: [{ functionDeclarations }],
-            temperature: 0.2,
-            thinkingConfig: thinkingFor(candidate),
-            abortSignal: signal,
-          },
-        });
-        if (candidate !== model) {
-          if (steps > 1) detachSignatures(contents);
-          model = candidate;
-        }
-        return stream;
+        const work = (async () => {
+            const stream = await gemini().models.generateContentStream({
+              model: candidate,
+              contents,
+              config: {
+                systemInstruction,
+                tools: [{ functionDeclarations }],
+                temperature: 0.2,
+                thinkingConfig: thinkingFor(candidate),
+                abortSignal,
+              },
+            });
+            const it = stream[Symbol.asyncIterator]();
+            return { it, head: await it.next() };
+          })();
+        work.catch(() => {}); // a loser of the race must not surface as an unhandled rejection
+        const first = await Promise.race([work, stall]);
+        clearTimeout(timer);
+        model = candidate;
+        return (async function* () {
+          if (!first.head.done) yield first.head.value;
+          for (;;) {
+            const next = await first.it.next();
+            if (next.done) return;
+            yield next.value;
+          }
+        })();
       } catch (err) {
+        clearTimeout(timer);
+        if (signal?.aborted) throw err;
+        if (err instanceof LlmStallError) {
+          metrics.increment("llm.stall_failover");
+          console.warn(JSON.stringify({ type: "llm", event: "stall_failover", model: candidate }));
+          markCooldown(candidate, 60_000);
+          lastError = err;
+          continue;
+        }
         if (adaptThinking(candidate, err)) {
           tried.delete(candidate);
           continue;

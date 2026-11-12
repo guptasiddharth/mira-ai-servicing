@@ -7,7 +7,7 @@ import { metrics } from "@/platform/observability/metrics";
  * UI are untouched.
  */
 
-const textModels = (process.env.GEMINI_TEXT_MODELS || process.env.GEMINI_TEXT_MODEL || "gemini-3.6-flash,gemini-3.5-flash,gemini-3-flash-preview,gemini-flash-latest,gemini-2.5-flash,gemini-3.1-flash-lite,gemini-3.5-flash-lite")
+const textModels = (process.env.GEMINI_TEXT_MODELS || process.env.GEMINI_TEXT_MODEL || "gemini-3-flash-preview,gemini-3.5-flash,gemini-3.6-flash,gemini-3.1-flash-lite,gemini-3.5-flash-lite")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
